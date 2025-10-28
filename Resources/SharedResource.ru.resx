@@ -2128,4 +2128,16 @@
   <data name="LocalRetentionRequiresServerRetention" xml:space="preserve">
       <value>Локальное хранение можно установить только в том случае, если также настроено хранение на сервере ('Удалить через (дней)').</value>
   </data>
+  <data name="PdfFormat" xml:space="preserve">
+    <value>Экспорт в PDF</value>
+  </data>
+  <data name="PdfFormatDescription" xml:space="preserve">
+    <value>Экспорт каждого письма в отдельный PDF-файл с группировкой по перепискам.</value>
+  </data>
+  <data name="PdfFormatInfo" xml:space="preserve">
+    <value>PDF-архив</value>
+  </data>
+  <data name="PdfFormatDetails" xml:space="preserve">
+    <value>На сервере создаётся папка с PDF-файлами писем и подпапками для цепочек. Для загрузки автоматически формируется ZIP-копия.</value>
+  </data>
 </root>

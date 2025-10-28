@@ -16,6 +16,7 @@ namespace MailArchiver.Models
         public string? ErrorMessage { get; set; }
         public string? CurrentEmailSubject { get; set; }
         public string? OutputFilePath { get; set; }
+        public string? OutputDirectoryPath { get; set; }
         public long OutputFileSize { get; set; }
         public int IncomingEmailsCount { get; set; }
         public int OutgoingEmailsCount { get; set; }
@@ -34,6 +35,7 @@ namespace MailArchiver.Models
     public enum AccountExportFormat
     {
         EML,
-        MBox
+        MBox,
+        Pdf
     }
 }

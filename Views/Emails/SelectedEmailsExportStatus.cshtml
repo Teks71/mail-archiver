@@ -36,10 +36,21 @@
                 </dd>
                 <dt class="col-sm-3">@Localizer["ExportFormat"]</dt>
                 <dd class="col-sm-9">
-                    @{
-                        var formatText = Model.Format == MailArchiver.Models.AccountExportFormat.EML ? "EML" : "MBox";
+                    @switch (Model.Format)
+                    {
+                        case MailArchiver.Models.AccountExportFormat.EML:
+                            <span class="badge bg-info">EML</span>
+                            break;
+                        case MailArchiver.Models.AccountExportFormat.MBox:
+                            <span class="badge bg-warning">MBox</span>
+                            break;
+                        case MailArchiver.Models.AccountExportFormat.Pdf:
+                            <span class="badge bg-danger">PDF</span>
+                            break;
+                        default:
+                            <span class="badge bg-secondary">@Model.Format.ToString()</span>
+                            break;
                     }
-                    @formatText
                 </dd>
                 <dt class="col-sm-3">@Localizer["TotalEmailsLabel"]</dt>
                 <dd class="col-sm-9">@Model.EmailIds.Count.ToString("N0")</dd>

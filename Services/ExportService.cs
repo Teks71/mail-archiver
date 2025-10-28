@@ -7,6 +7,10 @@ using System.IO.Compression;
 using System.Text;
 using MimeKit;
 using System.Globalization;
+using QuestPDF.Fluent;
+using QuestPDF.Infrastructure;
+using System.Text.RegularExpressions;
+using System.Net;
 
 namespace MailArchiver.Services
 {
@@ -34,6 +38,8 @@ namespace MailArchiver.Services
             _batchOptions = batchOptions.Value;
             _timeZoneOptions = timeZoneOptions.Value;
             _exportsPath = Path.Combine(environment.ContentRootPath, "exports");
+
+            QuestPDF.Settings.License = LicenseType.Community;
 
             // Create exports directory if it doesn't exist
             Directory.CreateDirectory(_exportsPath);
@@ -186,6 +192,22 @@ namespace MailArchiver.Services
                         _logger.LogWarning(ex, "Failed to delete old export file {FilePath}", job.OutputFilePath);
                     }
                 }
+
+                if (!string.IsNullOrEmpty(job.OutputDirectoryPath))
+                {
+                    try
+                    {
+                        if (Directory.Exists(job.OutputDirectoryPath))
+                        {
+                            Directory.Delete(job.OutputDirectoryPath, recursive: true);
+                            _logger.LogInformation("Deleted old export directory {Directory}", job.OutputDirectoryPath);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to delete old export directory {Directory}", job.OutputDirectoryPath);
+                    }
+                }
             }
 
             if (toRemove.Any())
@@ -286,6 +308,10 @@ namespace MailArchiver.Services
                 {
                     await ExportToMBoxFormat(job, context, cancellationToken);
                 }
+                else if (job.Format == AccountExportFormat.Pdf)
+                {
+                    await ExportToPdfFormat(job, context, cancellationToken);
+                }
 
                 if (job.Status != AccountExportJobStatus.Cancelled)
                 {
@@ -319,7 +345,19 @@ namespace MailArchiver.Services
                         _logger.LogWarning(ex, "Failed to delete partial export file {FilePath}", job.OutputFilePath);
                     }
                 }
-                
+
+                if (!string.IsNullOrEmpty(job.OutputDirectoryPath) && Directory.Exists(job.OutputDirectoryPath))
+                {
+                    try
+                    {
+                        Directory.Delete(job.OutputDirectoryPath, recursive: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to delete partial export directory {Directory}", job.OutputDirectoryPath);
+                    }
+                }
+
                 _logger.LogInformation("Export job {JobId} was cancelled", job.JobId);
             }
             catch (Exception ex)
@@ -328,6 +366,18 @@ namespace MailArchiver.Services
                 job.Completed = DateTime.UtcNow;
                 job.ErrorMessage = ex.Message;
                 _logger.LogError(ex, "Export job {JobId} failed", job.JobId);
+
+                if (!string.IsNullOrEmpty(job.OutputDirectoryPath) && Directory.Exists(job.OutputDirectoryPath))
+                {
+                    try
+                    {
+                        Directory.Delete(job.OutputDirectoryPath, recursive: true);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.LogWarning(cleanupEx, "Failed to clean export directory after failure {Directory}", job.OutputDirectoryPath);
+                    }
+                }
             }
             finally
             {
@@ -499,6 +549,298 @@ namespace MailArchiver.Services
             }
 
             await writer.FlushAsync();
+        }
+
+        private async Task ExportToPdfFormat(AccountExportJob job, MailArchiverDbContext context, CancellationToken cancellationToken)
+        {
+            var exportFolderName = Path.GetFileNameWithoutExtension(job.OutputFilePath) + "_pdf";
+            var exportFolderPath = Path.Combine(_exportsPath, exportFolderName);
+
+            if (Directory.Exists(exportFolderPath))
+            {
+                Directory.Delete(exportFolderPath, recursive: true);
+            }
+
+            Directory.CreateDirectory(exportFolderPath);
+            job.OutputDirectoryPath = exportFolderPath;
+
+            var threadDirectories = new Dictionary<string, ThreadExportInfo>(StringComparer.OrdinalIgnoreCase);
+
+            var emails = context.ArchivedEmails
+                .Where(e => e.MailAccountId == job.MailAccountId)
+                .Include(e => e.Attachments)
+                .OrderBy(e => e.SentDate)
+                .AsAsyncEnumerable();
+
+            await foreach (var email in emails.WithCancellation(cancellationToken))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                job.CurrentEmailSubject = email.Subject;
+
+                var conversationKey = NormalizeSubject(email.Subject);
+                if (string.IsNullOrWhiteSpace(conversationKey))
+                {
+                    conversationKey = "No Subject";
+                }
+
+                if (!threadDirectories.TryGetValue(conversationKey, out var threadInfo))
+                {
+                    var baseDirectoryName = SanitizeFileName(conversationKey);
+                    var uniqueDirectoryName = EnsureUniqueDirectoryName(exportFolderPath, baseDirectoryName);
+                    var directoryPath = Path.Combine(exportFolderPath, uniqueDirectoryName);
+                    Directory.CreateDirectory(directoryPath);
+                    threadInfo = new ThreadExportInfo(directoryPath);
+                    threadDirectories[conversationKey] = threadInfo;
+                }
+
+                threadInfo.EmailCounter++;
+
+                var sanitizedSubject = SanitizeFileName(email.Subject);
+                var prefix = $"{threadInfo.EmailCounter:D4}_{email.SentDate:yyyyMMdd_HHmmss}_{(email.IsOutgoing ? "Out" : "In")}";
+                var pdfFileName = $"{prefix}_{sanitizedSubject}.pdf";
+                pdfFileName = EnsureUniqueFileName(threadInfo.DirectoryPath, pdfFileName);
+                var pdfFilePath = Path.Combine(threadInfo.DirectoryPath, pdfFileName);
+
+                await GeneratePdfForEmail(email, pdfFilePath, cancellationToken);
+
+                job.ProcessedEmails++;
+
+                if (job.ProcessedEmails % 10 == 0 && _batchOptions.PauseBetweenEmailsMs > 0)
+                {
+                    await Task.Delay(_batchOptions.PauseBetweenEmailsMs, cancellationToken);
+                }
+
+                if (job.ProcessedEmails % 100 == 0)
+                {
+                    var progressPercent = job.TotalEmails > 0 ? (job.ProcessedEmails * 100.0 / job.TotalEmails) : 0;
+                    _logger.LogInformation("Job {JobId}: Processed {Processed} emails ({Progress:F1}%)",
+                        job.JobId, job.ProcessedEmails, progressPercent);
+                }
+            }
+
+            if (!string.IsNullOrEmpty(job.OutputFilePath))
+            {
+                if (File.Exists(job.OutputFilePath))
+                {
+                    File.Delete(job.OutputFilePath);
+                }
+
+                ZipFile.CreateFromDirectory(exportFolderPath, job.OutputFilePath, CompressionLevel.Optimal, includeBaseDirectory: false);
+            }
+        }
+
+        private async Task GeneratePdfForEmail(ArchivedEmail email, string filePath, CancellationToken cancellationToken)
+        {
+            var bodyContent = string.IsNullOrWhiteSpace(email.Body)
+                ? ConvertHtmlToPlainText(email.HtmlBody)
+                : email.Body;
+
+            var attachmentDescriptions = email.Attachments?
+                .Select(a =>
+                {
+                    var fileName = Path.GetFileName(a.FileName);
+                    if (string.IsNullOrWhiteSpace(fileName))
+                    {
+                        fileName = "attachment";
+                    }
+
+                    var size = a.Size;
+                    var contentType = string.IsNullOrWhiteSpace(a.ContentType) ? string.Empty : a.ContentType;
+                    if (string.IsNullOrEmpty(contentType))
+                    {
+                        return string.IsNullOrEmpty(fileName)
+                            ? null
+                            : $"{fileName} ({FormatFileSize(size)})";
+                    }
+
+                    return $"{fileName} ({contentType}, {FormatFileSize(size)})";
+                })
+                .Where(a => !string.IsNullOrWhiteSpace(a))
+                .ToList() ?? new List<string>();
+
+            var sentDate = email.SentDate.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+            var receivedDate = email.ReceivedDate.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+
+            await Task.Run(() =>
+            {
+                var document = Document.Create(container =>
+                {
+                    container.Page(page =>
+                    {
+                        page.Size(PageSizes.A4);
+                        page.Margin(35);
+                        page.DefaultTextStyle(x => x.FontSize(11));
+
+                        page.Content().Column(column =>
+                        {
+                            column.Spacing(10);
+
+                            column.Item().Text(string.IsNullOrWhiteSpace(email.Subject) ? "(No Subject)" : email.Subject)
+                                .FontSize(18)
+                                .SemiBold();
+
+                            column.Item().Text(text =>
+                            {
+                                text.Line($"Sent: {sentDate}");
+                                text.Line($"Received: {receivedDate}");
+                            });
+
+                            column.Item().Text(text =>
+                            {
+                                text.Line($"From: {FormatAddressList(email.From)}");
+                                if (!string.IsNullOrWhiteSpace(email.To))
+                                {
+                                    text.Line($"To: {FormatAddressList(email.To)}");
+                                }
+                                if (!string.IsNullOrWhiteSpace(email.Cc))
+                                {
+                                    text.Line($"Cc: {FormatAddressList(email.Cc)}");
+                                }
+                                if (!string.IsNullOrWhiteSpace(email.Bcc))
+                                {
+                                    text.Line($"Bcc: {FormatAddressList(email.Bcc)}");
+                                }
+                            });
+
+                            if (attachmentDescriptions.Any())
+                            {
+                                column.Item().Column(list =>
+                                {
+                                    list.Spacing(2);
+                                    list.Item().Text("Attachments:").SemiBold();
+                                    foreach (var attachment in attachmentDescriptions)
+                                    {
+                                        list.Item().Text($"• {attachment}");
+                                    }
+                                });
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(bodyContent))
+                            {
+                                column.Item().Column(body =>
+                                {
+                                    body.Item().Text("Body:").SemiBold();
+                                    body.Item().PaddingTop(4).Text(bodyContent);
+                                });
+                            }
+                            else
+                            {
+                                column.Item().Text("Body: (empty)").Italic();
+                            }
+                        });
+                    });
+                });
+
+                document.GeneratePdf(filePath);
+            }, cancellationToken);
+        }
+
+        private string NormalizeSubject(string? subject)
+        {
+            if (string.IsNullOrWhiteSpace(subject))
+            {
+                return string.Empty;
+            }
+
+            var normalized = subject.Trim();
+            normalized = Regex.Replace(normalized, @"^(re|fw|fwd):", string.Empty, RegexOptions.IgnoreCase).Trim();
+            return normalized;
+        }
+
+        private string EnsureUniqueDirectoryName(string rootPath, string baseName)
+        {
+            if (string.IsNullOrWhiteSpace(baseName))
+            {
+                baseName = "Conversation";
+            }
+
+            var candidate = baseName;
+            var index = 1;
+
+            while (Directory.Exists(Path.Combine(rootPath, candidate)))
+            {
+                candidate = $"{baseName}_{index}";
+                index++;
+            }
+
+            return candidate;
+        }
+
+        private string EnsureUniqueFileName(string directoryPath, string fileName)
+        {
+            var baseName = Path.GetFileNameWithoutExtension(fileName);
+            var extension = Path.GetExtension(fileName);
+
+            var candidate = fileName;
+            var index = 1;
+
+            while (File.Exists(Path.Combine(directoryPath, candidate)))
+            {
+                candidate = $"{baseName}_{index}{extension}";
+                index++;
+            }
+
+            return candidate;
+        }
+
+        private string ConvertHtmlToPlainText(string? html)
+        {
+            if (string.IsNullOrWhiteSpace(html))
+            {
+                return string.Empty;
+            }
+
+            var text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
+            text = Regex.Replace(text, @"</p>", "\n", RegexOptions.IgnoreCase);
+            text = Regex.Replace(text, @"<p[^>]*>", string.Empty, RegexOptions.IgnoreCase);
+            text = Regex.Replace(text, @"<[^>]+>", string.Empty);
+            text = WebUtility.HtmlDecode(text);
+            return text.Replace("\r", string.Empty).Trim();
+        }
+
+        private string FormatAddressList(string? addresses)
+        {
+            if (string.IsNullOrWhiteSpace(addresses))
+            {
+                return "-";
+            }
+
+            return string.Join(", ", addresses
+                .Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(a => a.Trim())
+                .Where(a => !string.IsNullOrWhiteSpace(a)));
+        }
+
+        private string FormatFileSize(long bytes)
+        {
+            if (bytes <= 0)
+            {
+                return "0 B";
+            }
+
+            string[] sizes = { "B", "KB", "MB", "GB" };
+            var order = 0;
+            double len = bytes;
+
+            while (len >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                len /= 1024;
+            }
+
+            return $"{len:0.##} {sizes[order]}";
+        }
+
+        private class ThreadExportInfo
+        {
+            public ThreadExportInfo(string directoryPath)
+            {
+                DirectoryPath = directoryPath;
+            }
+
+            public string DirectoryPath { get; }
+            public int EmailCounter { get; set; }
         }
 
         private async Task<MimeMessage> CreateMimeMessageFromArchived(ArchivedEmail email)
