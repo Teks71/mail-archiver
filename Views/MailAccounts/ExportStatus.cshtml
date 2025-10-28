@@ -21,13 +21,20 @@
                                 
                                 <dt class="col-sm-4">@Localizer["Format"]:</dt>
                                 <dd class="col-sm-8">
-                                    @if (Model.Format == MailArchiver.Models.AccountExportFormat.EML)
+                                    @switch (Model.Format)
                                     {
-                                        <span class="badge bg-info">@Localizer["EMLFormat"]</span>
-                                    }
-                                    else
-                                    {
-                                        <span class="badge bg-warning">@Localizer["MBoxFormat"]</span>
+                                        case MailArchiver.Models.AccountExportFormat.EML:
+                                            <span class="badge bg-info">@Localizer["EMLFormat"]</span>
+                                            break;
+                                        case MailArchiver.Models.AccountExportFormat.MBox:
+                                            <span class="badge bg-warning">@Localizer["MBoxFormat"]</span>
+                                            break;
+                                        case MailArchiver.Models.AccountExportFormat.Pdf:
+                                            <span class="badge bg-danger">@Localizer["PdfFormat"]</span>
+                                            break;
+                                        default:
+                                            <span class="badge bg-secondary">@Model.Format.ToString()</span>
+                                            break;
                                     }
                                 </dd>
                                 

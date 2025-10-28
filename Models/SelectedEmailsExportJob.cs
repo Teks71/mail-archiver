@@ -19,6 +19,7 @@ namespace MailArchiver.Models
         public string? ErrorMessage { get; set; }
         public string? CurrentEmailSubject { get; set; }
         public string? OutputFilePath { get; set; }
+        public string? OutputDirectoryPath { get; set; }
         public long OutputFileSize { get; set; }
         public AccountExportFormat Format { get; set; } = AccountExportFormat.EML;
     }
